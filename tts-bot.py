@@ -1,14 +1,15 @@
 import discord
 from discord import app_commands
-import torch
+
+from collections import defaultdict
+import configparser
 import asyncio
+import json
 import os
 import re
-import configparser
+
+import torch
 from TTS.api import TTS
-import soundfile as sf  # for safe audio loading if needed
-from collections import defaultdict
-import json
 
 # -------------------    CONFIG    -------------------
 
@@ -16,10 +17,14 @@ config = configparser.ConfigParser()
 config.read("config.cfg")
 
 BOT_TOKEN           = config["Bot"]["token"]
-IDLE_TIMEOUT        = int(config["TTS"]["idle_time"])
+IDLE_TIMEOUT        = int(config["Bot"]["idle_time"])
+
+ALLOWED_CHANNEL_ID  = int(config["TTS"]["channel"]) if config["TTS"]["channel"].strip() else None
 DEFAULT_LANGUAGE    = config["TTS"]["default_lang"]
 DEFAULT_SPEAKER     = config["TTS"]["default_sp"]
-ALLOWED_CHANNEL_ID  = int(config["TTS"]["channel"]) if config["TTS"]["channel"].strip() else None
+MEDIA_MSG           = config["TTS"]["media_msg"]
+RESTRICT_VOICES     = list(i for i in config["TTS"]["restricted_voices"].split(","))
+AUTHORIZED_USERS    = list(int(i) for i in config["TTS"]["authorized_users"].split(","))
 
 # ----------------------------------------------------
 
@@ -84,6 +89,25 @@ class TTSBot(discord.Client):
         self.reset_idle_timer(guild_id)
         return vc
     
+    async def join_voice_from_message(self, message: discord.Message):
+        """Helper to join voice from a normal message (not interaction)"""
+        channel = message.author.voice.channel
+        guild_id = message.guild.id
+
+        if guild_id not in self._voice_clients or not self._voice_clients[guild_id].is_connected():
+            try:
+                vc = await channel.connect()
+                self._voice_clients[guild_id] = vc
+                print(f"[TTSBot] Auto-joined voice channel: {channel.name}")
+            except Exception as e:
+                print(f"[Join Error] {e}")
+                return None
+        else:
+            vc = self._voice_clients[guild_id]
+
+        self.reset_idle_timer(guild_id)
+        return vc
+
     def reset_idle_timer(self, guild_id: int):
         """Reset the idle disconnect timer"""
         # Cancel existing timer
@@ -121,6 +145,47 @@ class TTSBot(discord.Client):
         except Exception as e:
             print(f"[TTSBot] Idle Timer Error: {e}")
 
+    def preprocess_text(self, text:str):
+        """Clean text for better TTS"""
+        if not text:
+            return ""
+        
+        import emoji
+
+        # Handle Discord custom emojis first (<:name:id> or <a:name:id>)
+        def replace_discord_emoji(match):
+            full = match.group(0)
+            # Extract the name (everything between the first : and the last :)
+            # For <:KEKW2x:123...>  → name = "KEKW2x"
+            # For <a:KEKW2x:123...> → name = "KEKW2x"
+            name_match = re.search(r':([^:]+):', full)
+            if name_match:
+                name = name_match.group(1)
+                # Make it more natural
+                return f"{name.replace('_', ' ')} "
+            return " "
+
+        text = re.sub(r'<a?:[^:]+:\d+>', replace_discord_emoji, text)
+
+        try:
+            with open("repĺacements.json", "r", encoding="utf-8") as f:
+                replacements = json.load(f)
+        except:
+            replacements = {"emojis":{}, "symbols":{}}
+
+        # Convert emojis to descriptions
+        def replace_unicode_emoji(emoji_char, data=None):
+            mapping = replacements["emojis"]
+            return mapping.get(emoji_char, emoji.demojize(emoji_char, language="es").replace(":", " ").replace("_", " ").strip())
+
+        text = emoji.replace_emoji(text, replace=replace_unicode_emoji)
+
+        # Fix common symbols / punctuation
+        for old, new in replacements["symbols"].items():
+            text = text.replace(old, new)
+
+        return text
+
     async def _play_text(self, voice_client, text: str, speaker: str, language: str, interaction=None):
         """Internal method to generate and play one message"""
 
@@ -154,7 +219,7 @@ class TTSBot(discord.Client):
                     os.remove(temp_path)
 
             except Exception as e:
-                print(f"[TTS Error] {e}")
+                print(f"[TTS Error] Playing: {e}")
                 if interaction and interaction.channel:
                     try:
                         await interaction.channel.send(f"Error generando audio: {str(e)[:100]}")
@@ -177,12 +242,18 @@ class TTSBot(discord.Client):
         # Get speaker for this user (or default)
         default_speaker = DEFAULT_SPEAKER
         if self.tts and self.tts.speakers:
-            default_speaker = self.tts.speakers[0]
+            default_speaker = self.tts.speakers[10]
 
         speaker = self.user_cfg.get(message.author.id, default_speaker)
 
+        # Preprocess text + detect media
+        clean_text = self.preprocess_text(message.content)
+
+        if message.attachments:
+            clean_text += f" {MEDIA_MSG}"
+
         # Add to queue (text = message.content)
-        await self.queues[guild_id].put((message.content, speaker, None))  # interaction=None for auto mode
+        await self.queues[guild_id].put((clean_text, speaker, None))  # interaction=None for auto mode
 
         # Start queue processor
         asyncio.create_task(self.process_queue(guild_id))
@@ -192,25 +263,6 @@ class TTSBot(discord.Client):
             await message.add_reaction("🎙️")
         except:
             pass
-
-    async def join_voice_from_message(self, message: discord.Message):
-        """Helper to join voice from a normal message (not interaction)"""
-        channel = message.author.voice.channel
-        guild_id = message.guild.id
-
-        if guild_id not in self._voice_clients or not self._voice_clients[guild_id].is_connected():
-            try:
-                vc = await channel.connect()
-                self._voice_clients[guild_id] = vc
-                print(f"[TTSBot] Auto-joined voice channel: {channel.name}")
-            except Exception as e:
-                print(f"[Join Error] {e}")
-                return None
-        else:
-            vc = self._voice_clients[guild_id]
-
-        self.reset_idle_timer(guild_id)
-        return vc
     
     async def process_queue(self, guild_id: int):
         """Background task that processes the queue for a guild"""
@@ -290,10 +342,12 @@ async def tts(interaction: discord.Interaction, text: str):
         return
     
     # Get user's chosen voice or default (first speaker)
-    speaker = client.user_cfg.get(interaction.user.id, client.tts.speakers[0] if client.tts.speakers else DEFAULT_SPEAKER)
+    speaker = client.user_cfg.get(interaction.user.id, client.tts.speakers[10] if client.tts.speakers else DEFAULT_SPEAKER)
+
+    clean_text = client.preprocess_text(text)
 
     # Add to queue
-    await client.queues[interaction.guild.id].put((text, speaker, interaction))
+    await client.queues[interaction.guild.id].put((clean_text, speaker, interaction))
 
     # Start queue processor if not running
     asyncio.create_task(client.process_queue(interaction.guild.id))
@@ -312,8 +366,14 @@ async def setvoice(interaction: discord.Interaction, voice: str = DEFAULT_SPEAKE
         await interaction.response.send_message(f"La voz **{voice}** no existe.\n", ephemeral=True)
         return
 
+    voice_name = voice.strip()
+
+    if voice_name in RESTRICT_VOICES and interaction.user.id != AUTHORIZED_USERS[RESTRICT_VOICES.index(voice_name)]: # Restriccion de voces
+        await interaction.response.send_message(f"No autorizo.\n", ephemeral=True)
+        return
+    
     # Save option
-    client.user_cfg[interaction.user.id] = voice.strip()
+    client.user_cfg[interaction.user.id] = voice_name
     client.dump_user_configs()
     await interaction.response.send_message(f"Tu voz ha sido cambiada a **{voice}**.", ephemeral=True)
 

@@ -156,32 +156,34 @@ class TTSBot(discord.Client):
         def replace_discord_emoji(match):
             full = match.group(0)
             # Extract the name (everything between the first : and the last :)
-            # For <:KEKW2x:123...>  → name = "KEKW2x"
-            # For <a:KEKW2x:123...> → name = "KEKW2x"
             name_match = re.search(r':([^:]+):', full)
             if name_match:
                 name = name_match.group(1)
-                # Make it more natural
                 return f"{name.replace('_', ' ')} "
             return " "
 
         text = re.sub(r'<a?:[^:]+:\d+>', replace_discord_emoji, text)
 
         try:
-            with open("repĺacements.json", "r", encoding="utf-8") as f:
+            with open("replacements.json", "r", encoding="utf-8") as f:
                 replacements = json.load(f)
-        except:
+        except Exception as e:
             replacements = {"emojis":{}, "symbols":{}}
+            print(f"[TTSBot] Could not open replacements.json: {e}")
+
+        emoji_mapping = replacements.get("emojis", {})
+        symbol_mapping = replacements.get("symbols", {})
 
         # Convert emojis to descriptions
         def replace_unicode_emoji(emoji_char, data=None):
-            mapping = replacements["emojis"]
-            return mapping.get(emoji_char, emoji.demojize(emoji_char, language="es").replace(":", " ").replace("_", " ").strip())
+            if emoji_char in emoji_mapping:
+                return emoji_mapping[emoji_char]
+            return emoji.demojize(emoji_char, language="es").replace(":", " ").replace("_", " ").strip()
 
         text = emoji.replace_emoji(text, replace=replace_unicode_emoji)
 
         # Fix common symbols / punctuation
-        for old, new in replacements["symbols"].items():
+        for old, new in symbol_mapping.items():
             text = text.replace(old, new)
 
         return text

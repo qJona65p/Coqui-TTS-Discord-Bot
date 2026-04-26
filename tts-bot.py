@@ -244,6 +244,10 @@ class TTSBot(discord.Client):
         if not text:
             return ""
 
+        # Link removal
+        pattern = r'(https?://)?([a-z0-9.-]+\.[a-z]{2,})([/\w.-]*)?(\?[^#\s]*)?(#[^\s]*)?'
+        text = re.sub(pattern, "Link", text)
+
         # Handle Discord custom emojis first (<:name:id> or <a:name:id>)
         def replace_discord_emoji(match):
             full = match.group(0)
@@ -314,6 +318,10 @@ class TTSBot(discord.Client):
     async def process_tts_message(self, message: discord.Message):
         """Automatically speak any message sent in the monitored text channel"""
         if self.is_banned(message.author.id):
+            try:
+                await message.add_reaction("❌")
+            except:
+                pass
             return
         
         guild_id = message.guild.id
@@ -330,7 +338,7 @@ class TTSBot(discord.Client):
         # Get speaker for this user (or default)
         default_speaker = DEFAULT_SPEAKER
         if self.tts and self.tts.speakers:
-            default_speaker = self.tts.speakers[10]
+            default_speaker = self.tts.speakers[20]
 
         speaker = self.user_cfg.get(message.author.id, default_speaker)
 
@@ -346,7 +354,7 @@ class TTSBot(discord.Client):
         # Start queue processor
         asyncio.create_task(self.process_queue(guild_id))
 
-        # Optional: React to the message so users know it's being processed
+        # React to the message so users know it's being processed
         try:
             await message.add_reaction("🎙️")
         except:
@@ -434,7 +442,7 @@ async def tts(interaction: discord.Interaction, text: str):
         return
     
     # Get user's chosen voice or default (first speaker)
-    speaker = client.user_cfg.get(interaction.user.id, client.tts.speakers[10] if client.tts.speakers else DEFAULT_SPEAKER)
+    speaker = client.user_cfg.get(interaction.user.id, client.tts.speakers[20] if client.tts.speakers else DEFAULT_SPEAKER)
 
     clean_text = client.preprocess_text(text)
 
@@ -475,9 +483,9 @@ async def voices(interaction: discord.Interaction):
         await interaction.response.send_message("Las voces aún no están cargadas.", ephemeral=True)
         return
     
-    speakers_list = "\n".join([f"• {s}" for s in sorted(client.tts.speakers[:60])])
+    speakers_list = "\n".join([f"• {s}" for s in client.tts.speakers[:60]])
     embed = discord.Embed(
-        title="Voces disponibles en XTTS-v2 (Primeras 60)",
+        title="Voces disponibles (Primeras 60)",
         description=speakers_list,
         color=0x00ff00
     )

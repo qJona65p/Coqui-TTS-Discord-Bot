@@ -39,11 +39,12 @@ class TTSBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tts = None
+        self.join_locks = {}   # guild_id -> asyncio.Lock
         self._voice_clients = {}        # guild_id -> voice_client
         self.user_cfg = {}              # user_id -> speaker_name
         self.banned_users = {}
 
-        self.load_bans() 
+        self.load_bans()
         self.load_user_configs()
         self.reload_replacements()
 
@@ -161,7 +162,7 @@ class TTSBot(discord.Client):
 
             # not join if AFK channel
             if channel.id == message.guild._afk_channel_id:
-                print(f"[TTSBot] Ignored message from AFK channel: {channel.name}")
+                print(f"[TTSBot] Ignored AFK channel: {channel.name}")
                 return None
 
         elif interaction:
@@ -178,29 +179,68 @@ class TTSBot(discord.Client):
                 print(f"[TTSBot] Ignored message from AFK channel: {channel.name}")
                 return None
         else: 
-            return
+            return None
 
-        # If bot is already connected elsewhere, move it to follow the user
-        if guild_id in self._voice_clients and self._voice_clients[guild_id].is_connected():
-            vc = self._voice_clients[guild_id]
-            if vc.channel.id != channel.id:
+        if guild_id not in self.join_locks:
+            self.join_locks[guild_id] = asyncio.Lock()
+
+        async with self.join_locks[guild_id]:
+            return await self._join_voice_internal(channel, guild_id)
+
+    async def _join_voice_internal(self, channel, guild_id: int):
+        vc = self._voice_clients.get(guild_id)
+
+        if vc and not vc.is_connected():
+            await self.force_cleanup(guild_id)
+            vc = None
+
+        if vc and vc.is_connected():
+            if vc.channel.id == channel.id:
+                self.reset_idle_timer(guild_id)
+                return vc
+            else:
+                # Move to different channel
                 try:
+                    if vc.is_playing():
+                        vc.stop()
                     await vc.move_to(channel)
                     print(f"[TTSBot] Moved to channel {channel.name}")
+                    self.reset_idle_timer(guild_id)
+                    return vc
                 except Exception as e:
                     print(f"[Move Error] {e}")
-                    return None
-        else:
+                    await self.force_cleanup(guild_id)
+
+        # === Fresh connection with retries ===
+        for attempt in range(3):  # up to 3 attempts
             try:
-                vc = await channel.connect()
+                print(f"[TTSBot] Join attempt {attempt+1}/3")
+                vc = await asyncio.wait_for(
+                    channel.connect(),
+                    timeout=6.0 if attempt == 0 else 4.0
+                )
                 self._voice_clients[guild_id] = vc
                 print(f"[TTSBot] Joined voice channel: {channel.name}")
-            except Exception as e:
-                print(f"[Join Error] {e}")
-                return None
+                self.reset_idle_timer(guild_id)
+                return vc
 
-        self.reset_idle_timer(guild_id)
-        return vc
+            except asyncio.TimeoutError:
+                print(f"[Join Timeout] Attempt {attempt+1}")
+                await self.force_cleanup(guild_id)
+                await asyncio.sleep(0.8 if attempt < 2 else 1.5)
+
+            except discord.ClientException as e:  # Already connected
+                print(f"[Join Error] Already connected: {e}")
+                await self.force_cleanup(guild_id)
+                await asyncio.sleep(0.7)
+
+            except Exception as e:
+                print(f"[Join Error] {type(e).__name__}: {e}")
+                await self.force_cleanup(guild_id)
+                await asyncio.sleep(1.0)
+
+        print(f"[TTSBot] Failed to join voice after 3 attempts")
+        return None
 
     def reset_idle_timer(self, guild_id: int):
         """Reset the idle disconnect timer"""
@@ -287,6 +327,10 @@ class TTSBot(discord.Client):
                 continue
 
             try:
+                if not voice_client.is_connected():
+                    print("[TTSBot] Voice client disconnected mid-playback, aborting.")
+                    return  # Let process_queue handle the broken state
+
                 temp_path = f"temp_tts_{voice_client.guild.id}.wav"
                 
                 await asyncio.to_thread(
@@ -296,10 +340,11 @@ class TTSBot(discord.Client):
                     language=language,
                     file_path=temp_path
                 )
+                if not voice_client.is_connected():  # Check again after TTS generation
+                    return
 
                 voice_client.play(discord.FFmpegPCMAudio(temp_path))
 
-                # Wait until finished
                 while voice_client.is_playing():
                     await asyncio.sleep(0.2)
 
@@ -309,6 +354,8 @@ class TTSBot(discord.Client):
 
             except Exception as e:
                 print(f"[TTS Error] Playing: {e}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)  # Clean up even on error
                 if interaction and interaction.channel:
                     try:
                         await interaction.channel.send(f"Error generando audio: {str(e)[:100]}")
@@ -403,15 +450,43 @@ class TTSBot(discord.Client):
         
         # Return up to 25 choices (Discord limit)
         return matching[:25]
+
+    async def force_cleanup(self, guild_id: int):
+        """Aggressive cleanup when state is broken"""
+        print(f"[TTSBot] Force cleaning voice state for guild {guild_id}")
+
+        vc = self._voice_clients.pop(guild_id, None)
+        if vc:
+            try:
+                await vc.disconnect(force=True)
+            except:
+                pass
+
+        # Clear queue
+        self.processing[guild_id] = False
+        queue = self.queues[guild_id]
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except:
+                break
+
+        if guild_id in self.idle_tasks and not self.idle_tasks[guild_id].done():
+            self.idle_tasks[guild_id].cancel()
+
+        # Clean lock if exists
+        self.join_locks.pop(guild_id, None)
+
+        await asyncio.sleep(0.3)
     
-# ------------------- BOT INSTANCE -------------------
+# -------------------- BOT EVENTS --------------------
 client = TTSBot()
 
 @client.event
 async def on_ready():
     print(f"[TTSBot] Logged in as {client.user}")
 
-# -------------------   COMMANDS   -------------------
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -423,6 +498,26 @@ async def on_message(message: discord.Message):
 
     # Process the message for TTS
     await client.process_tts_message(message)
+
+@client.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.id != client.user.id:
+        return
+
+    guild_id = None
+    if before.channel:
+        guild_id = before.channel.guild.id
+    elif after.channel:
+        guild_id = after.channel.guild.id
+
+    if not guild_id:
+        return
+
+    if before.channel and not after.channel:
+        print(f"[TTSBot] Bot disconnected from voice in guild {guild_id}")
+        await client.force_cleanup(guild_id)
+
+# -------------------   COMMANDS   -------------------
 
 @client.tree.command(name="tts", description="Un tts we, que esperabas")
 @app_commands.describe(text="El texto que quieres que hable")

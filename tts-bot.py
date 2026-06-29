@@ -48,6 +48,7 @@ class TTSBot(discord.Client):
         self.load_user_configs()
         self.reload_replacements()
 
+        self._intentional_disconnect = set()
         self.queues = defaultdict(asyncio.Queue)   # guild_id -> asyncio.Queue of tasks
         self.processing = defaultdict(bool)        # guild_id -> is currently playing
         self.idle_tasks = {}
@@ -203,13 +204,12 @@ class TTSBot(discord.Client):
                 try:
                     if vc.is_playing():
                         vc.stop()
-                    await vc.move_to(channel)
-                    print(f"[TTSBot] Moved to channel {channel.name}")
-                    self.reset_idle_timer(guild_id)
-                    return vc
+                    await self.force_cleanup(guild_id)
+                    await asyncio.sleep(1)
                 except Exception as e:
                     print(f"[Move Error] {e}")
                     await self.force_cleanup(guild_id)
+                vc = None
 
         # === Fresh connection with retries ===
         for attempt in range(3):  # up to 3 attempts
@@ -455,12 +455,23 @@ class TTSBot(discord.Client):
         """Aggressive cleanup when state is broken"""
         print(f"[TTSBot] Force cleaning voice state for guild {guild_id}")
 
+        self._intentional_disconnect.add(guild_id)
+
         vc = self._voice_clients.pop(guild_id, None)
         if vc:
             try:
                 await vc.disconnect(force=True)
             except:
                 pass
+
+        # Clear discord internal tracking
+        guild = self.get_guild(guild_id)
+        if guild and guild.voice_client:
+            if vc is None or guild.voice_client is vc:
+                try:
+                    await guild.voice_client.disconnect(force=True)
+                except:
+                    pass
 
         # Clear queue
         self.processing[guild_id] = False
@@ -475,10 +486,8 @@ class TTSBot(discord.Client):
         if guild_id in self.idle_tasks and not self.idle_tasks[guild_id].done():
             self.idle_tasks[guild_id].cancel()
 
-        # Clean lock if exists
-        self.join_locks.pop(guild_id, None)
-
         await asyncio.sleep(0.3)
+        self._intentional_disconnect.discard(guild_id)
     
 # -------------------- BOT EVENTS --------------------
 client = TTSBot()
@@ -514,8 +523,21 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         return
 
     if before.channel and not after.channel:
+        # Skip if this disconnect was triggered by our own cleanup
+        if guild_id in client._intentional_disconnect:
+            print(f"[TTSBot] Ignoring intentional disconnect event for guild {guild_id}")
+            return
+        # Skip if we've already reconnected
+        vc = client._voice_clients.get(guild_id)
+        if vc and vc.is_connected():
+            print(f"[TTSBot] Ignoring stale disconnect event — already reconnected")
+            return
+
         print(f"[TTSBot] Bot disconnected from voice in guild {guild_id}")
-        await client.force_cleanup(guild_id)
+        if guild_id not in client.join_locks:
+            client.join_locks[guild_id] = asyncio.Lock()
+        async with client.join_locks[guild_id]:
+            await client.force_cleanup(guild_id)
 
 # -------------------   COMMANDS   -------------------
 
